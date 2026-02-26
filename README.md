@@ -13,6 +13,8 @@ Designed for maximum speed and efficiency in resource-constrained environments.
     - **Spatial Grouping**: Weights candidates by center-proximity and eye-pair geometry.
     - **Radial Gradient Validation**: Filters dark spots by analyzing light-gradient transitions (dark center → bright sclera).
 - **Extreme Area Reduction**: Real-time tuning enables ~80% reduction in screen area while maintaining >90% capture rate in tests
+> [!NOTE]
+> This preformance is not stable and dependant on circumstances, fast movement and bad positioning can muck it up
 
 # Usage:
 
@@ -38,3 +40,4 @@ uv run benchmark.py
 - `numpy`
 - `dlib` (Benchmark tool only)
 - `uv` (Recommended package manager)
+
