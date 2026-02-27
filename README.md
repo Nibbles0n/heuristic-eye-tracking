@@ -16,6 +16,9 @@ Designed for maximum speed and efficiency in resource-constrained environments.
 > [!NOTE]
 > This preformance is not stable and dependant on circumstances, fast movement and bad positioning can muck it up
 
+# New Version:
+- A new, better version that can be used by running main.py
+
 # Usage:
 
 Production script:
@@ -40,4 +43,5 @@ uv run benchmark.py
 - `numpy`
 - `dlib` (Benchmark tool only)
 - `uv` (Recommended package manager)
+
 
