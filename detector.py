@@ -7,7 +7,8 @@ DEFAULT_CONFIG = {
     # Detection
     "dark_percentile": 10,
     "min_area": 5,
-    "max_area": 1000,
+    "max_area": 1200,
+    "max_area_fraction": 0.02,    # 2% of frame area — anything bigger is not a pupil
     "min_circularity": 0.15,      # Lenient — let spatial filters do the work
     "min_contrast": 23,
     "contrast_ring": 2.5,
@@ -123,10 +124,15 @@ class EyeDetector:
 
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        h, w = gray_frame.shape
+        max_area_abs = self.config["max_area"]
+        max_area_rel = self.config["max_area_fraction"] * h * w
+        max_area = min(max_area_abs, max_area_rel)
+
         candidates = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < self.config["min_area"] or area > self.config["max_area"]:
+            if area < self.config["min_area"] or area > max_area:
                 continue
             perimeter = cv2.arcLength(cnt, True)
             if perimeter == 0:
