@@ -1,4 +1,4 @@
-# Hyper Efficient Eye Cropping
+# Hyper Efficient Eye Cropping/Tracking
 
 A high-performance eye tracking and cropping tool that uses **pure heuristics and mathematical filters** instead of machine learning models for production execution. 
 
@@ -43,5 +43,6 @@ uv run benchmark.py
 - `numpy`
 - `dlib` (Benchmark tool only)
 - `uv` (Recommended package manager)
+
 
 
