@@ -10,27 +10,38 @@ DEFAULT_CONFIG = {
     "max_area": 1200,
     "max_area_fraction": 0.02,    # 2% of frame area — anything bigger is not a pupil
     "min_circularity": 0.15,      # Lenient — let spatial filters do the work
+    "min_radius": 2,
+    "max_radius": 14,             # In processing-resolution pixels
     "min_contrast": 23,
     "contrast_ring": 2.5,
-    
+
     # Spatial filters
     "center_weight": 0.3,         # How much center proximity boosts score (0=off, 1=strong)
-    "pair_distance_min": 20,      # Min px distance between eye pair (at proc resolution)
+    "pair_distance_min": 40,      # Min px distance between eye pair (at proc resolution)
     "pair_distance_max": 150,     # Max px distance between eye pair
+    "pair_y_tolerance": 30,       # Max vertical offset between eyes (at proc resolution)
     "pair_boost": 1.5,            # Score multiplier for paired candidates
     "size_consistency_penalty": 0.5,  # Penalty applied when eye sizes differ (0=off, 1=harsh)
-    
+    "pair_top_k": 20,             # Search deeper than top-8 to avoid missing one eye
+
     # Gradient ring
     "gradient_weight": 0.2,       # How much gradient ring score contributes
-    
-    # Cropping
-    "crop_v_mult": 3.5,
-    "crop_h_mult": 6.5,
-    
+
+    # Cropping — multipliers applied to radius in original-resolution pixels
+    "crop_v_mult": 2.0,
+    "crop_h_mult": 3.0,
+    "max_crop_radius": 12,
+
+    # Search ROI: only look in the upper fraction of the frame (eyes are never at the bottom)
+    "search_top_fraction": 0.65,
+
     # Kalman filter
     "kalman_process_noise": 1e-2,
     "kalman_measurement_noise": 1.0,
-    
+    "tracker_match_dist": 35,     # Max match distance (proc px) from detection to tracker
+    "tracker_roi_mult": 3.0,      # ROI expansion around tracked eyes
+    "max_missed_frames": 6,       # Drop stale trackers faster to reduce drifting boxes
+
     # Processing
     "processing_width": 400,
 }
@@ -102,6 +113,14 @@ class EyeDetector:
         self.jitter = 0
         self.last_raw_centers = []
 
+    def _upper_mask(self, gray):
+        """Returns a mask covering only the upper portion of the frame (where eyes live)."""
+        h, w = gray.shape
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cutoff = int(h * self.config["search_top_fraction"])
+        mask[:cutoff, :] = 255
+        return mask
+
     def find_pupil_candidates(self, gray_frame, roi_mask=None):
         search_gray = gray_frame
         if roi_mask is not None:
@@ -140,6 +159,8 @@ class EyeDetector:
             circularity = 4 * np.pi * (area / (perimeter * perimeter))
             if circularity > self.config["min_circularity"]:
                 (x, y), radius = cv2.minEnclosingCircle(cnt)
+                if radius < self.config["min_radius"] or radius > self.config["max_radius"]:
+                    continue
                 candidates.append({
                     "center": (int(x), int(y)),
                     "radius": int(max(3, radius)),
@@ -202,24 +223,29 @@ class EyeDetector:
         return scored
 
     def apply_pair_filters(self, scored):
-        """Pair proximity + size consistency scoring."""
+        """Pair proximity + size consistency + Y-alignment scoring."""
         if len(scored) < 2:
-            return scored
+            # No pair possible; return nothing so trackers coast on Kalman prediction
+            return []
 
         cfg = self.config
         best_pair = None
         best_pair_score = -1
 
         # Try all pairs to find the best eye pair
-        for i in range(min(len(scored), 6)):
-            for j in range(i + 1, min(len(scored), 6)):
+        top_k = min(len(scored), self.config["pair_top_k"])
+        for i in range(top_k):
+            for j in range(i + 1, top_k):
                 a, b = scored[i], scored[j]
                 ax, ay = a["center"]
                 bx, by = b["center"]
-                dist = np.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
 
-                # Check distance is plausible for an eye pair
-                if dist < cfg["pair_distance_min"] or dist > cfg["pair_distance_max"]:
+                # Eyes must be side-by-side, not stacked vertically
+                if abs(ay - by) > cfg["pair_y_tolerance"]:
+                    continue
+
+                horiz_dist = abs(ax - bx)
+                if horiz_dist < cfg["pair_distance_min"] or horiz_dist > cfg["pair_distance_max"]:
                     continue
 
                 # Size consistency: soft penalty based on radius difference
@@ -236,12 +262,13 @@ class EyeDetector:
         if best_pair:
             i, j = best_pair
             return [scored[i], scored[j]]
-        
-        # Fallback: return top 2
-        return scored[:2]
+
+        # No valid pair found — return nothing; Kalman trackers will coast
+        return []
 
     def get_crop_box(self, cx, cy, r, scale, orig_w, orig_h):
         """Returns (x1, y1, x2, y2) crop box in original resolution."""
+        r = min(r, self.config["max_crop_radius"])
         fx = int(cx / scale)
         fy = int(cy / scale)
         hv = int(r * self.config["crop_v_mult"] / scale)
@@ -267,57 +294,75 @@ class EyeDetector:
         # CLAHE: normalize contrast across skin tones and lighting
         gray = self.clahe.apply(gray)
 
-        # Adaptive ROI from trackers
+        # Adaptive ROI from trackers — expand around each tracked eye
         roi_mask = None
         if self.trackers:
             roi_mask = np.zeros_like(gray)
             for t in self.trackers:
                 pos, r = t.predict()
-                cv2.circle(roi_mask, pos, int(r * 4), 255, -1)
+                cv2.circle(roi_mask, pos, int(r * self.config["tracker_roi_mult"]), 255, -1)
 
         # Find & score candidates
-        candidates = self.find_pupil_candidates(gray, roi_mask)
-        if not candidates and roi_mask is not None:
-            candidates = self.find_pupil_candidates(gray, None)  # Fallback: full frame
-        elif not self.trackers:
-            candidates = self.find_pupil_candidates(gray, None)
+        if roi_mask is not None:
+            candidates = self.find_pupil_candidates(gray, roi_mask)
+            if not candidates:  # Lost tracking — fall back to upper-frame search
+                candidates = self.find_pupil_candidates(gray, self._upper_mask(gray))
+        else:
+            # No trackers yet — restrict search to upper portion of frame
+            candidates = self.find_pupil_candidates(gray, self._upper_mask(gray))
 
         scored = self.score_candidates(gray, candidates)
         best_eyes = self.apply_pair_filters(scored)
 
         # Kalman update: match detections to trackers
         current_raw_centers = []
-        used_trackers = set()
-        
+        max_match = self.config["tracker_match_dist"]
+
         for eye in best_eyes:
             ecx, ecy = eye["center"]
-            er = eye["radius"]
             current_raw_centers.append((ecx, ecy))
 
-            # Find closest tracker
-            best_t = None
-            min_dist = float('inf')
-            for idx, t in enumerate(self.trackers):
-                if idx in used_trackers:
-                    continue
-                d = np.sqrt((ecx - t.state[0]) ** 2 + (ecy - t.state[1]) ** 2)
-                if d < 50 and d < min_dist:
-                    min_dist = d
-                    best_t = idx
+        # Stable left/right assignment when two eyes and two trackers exist.
+        if len(best_eyes) == 2 and len(self.trackers) == 2:
+            tracker_order = sorted(range(2), key=lambda i: self.trackers[i].state[0])
+            eye_order = sorted(best_eyes, key=lambda e: e["center"][0])
+            for tidx, eye in zip(tracker_order, eye_order):
+                ecx, ecy = eye["center"]
+                er = eye["radius"]
+                d = np.sqrt((ecx - self.trackers[tidx].state[0]) ** 2 + (ecy - self.trackers[tidx].state[1]) ** 2)
+                if d <= max_match:
+                    self.trackers[tidx].update(ecx, ecy, er)
+        else:
+            used_trackers = set()
+            for eye in best_eyes:
+                ecx, ecy = eye["center"]
+                er = eye["radius"]
+                best_t = None
+                min_dist = float("inf")
+                for idx, t in enumerate(self.trackers):
+                    if idx in used_trackers:
+                        continue
+                    d = np.sqrt((ecx - t.state[0]) ** 2 + (ecy - t.state[1]) ** 2)
+                    if d < max_match and d < min_dist:
+                        min_dist = d
+                        best_t = idx
 
-            if best_t is not None:
-                self.trackers[best_t].update(ecx, ecy, er)
-                used_trackers.add(best_t)
-            else:
-                # New tracker
-                t = KalmanTracker(ecx, ecy, er,
-                                  self.config["kalman_process_noise"],
-                                  self.config["kalman_measurement_noise"])
-                self.trackers.append(t)
-                used_trackers.add(len(self.trackers) - 1)
+                if best_t is not None:
+                    self.trackers[best_t].update(ecx, ecy, er)
+                    used_trackers.add(best_t)
+                elif len(self.trackers) < 2:
+                    t = KalmanTracker(
+                        ecx,
+                        ecy,
+                        er,
+                        self.config["kalman_process_noise"],
+                        self.config["kalman_measurement_noise"],
+                    )
+                    self.trackers.append(t)
+                    used_trackers.add(len(self.trackers) - 1)
 
-        # Remove stale trackers (missed > 10 frames)
-        self.trackers = [t for t in self.trackers if t.missed < 10]
+        # Remove stale trackers quickly so drifted boxes disappear sooner.
+        self.trackers = [t for t in self.trackers if t.missed < self.config["max_missed_frames"]]
         # Keep at most 2 trackers (2 eyes)
         if len(self.trackers) > 2:
             self.trackers.sort(key=lambda t: t.missed)
